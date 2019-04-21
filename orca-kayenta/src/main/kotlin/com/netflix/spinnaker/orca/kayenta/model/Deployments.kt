@@ -30,7 +30,7 @@ import java.time.Duration
 internal data class Deployments(
   val baseline: Baseline,
   val serverGroupPairs: List<ServerGroupPair>,
-  val delayBeforeCleanup: Duration = Duration.ofHours(1)
+  val delayBeforeCleanup: Duration = Duration.ZERO
 )
 
 /**
@@ -83,7 +83,7 @@ internal data class ServerGroupSpec(
  */
 internal val ServerGroupSpec.cluster: String
   get() = when {
-    moniker != null -> moniker.cluster
+    moniker != null && moniker.cluster != null -> moniker.cluster
     application != null -> {
       val builder = AutoScalingGroupNameBuilder()
       builder.appName = application

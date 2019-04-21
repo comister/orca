@@ -19,11 +19,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.netflix.spinnaker.config.TransactionRetryProperties
 import com.netflix.spinnaker.kork.core.RetrySupport
 import com.netflix.spinnaker.orca.ExecutionStatus
-import com.netflix.spinnaker.orca.ExecutionStatus.BUFFERED
-import com.netflix.spinnaker.orca.ExecutionStatus.CANCELED
-import com.netflix.spinnaker.orca.ExecutionStatus.NOT_STARTED
-import com.netflix.spinnaker.orca.ExecutionStatus.PAUSED
-import com.netflix.spinnaker.orca.ExecutionStatus.RUNNING
+import com.netflix.spinnaker.orca.ExecutionStatus.*
 import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType
 import com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType.ORCHESTRATION
@@ -32,25 +28,16 @@ import com.netflix.spinnaker.orca.pipeline.model.Execution.PausedDetails
 import com.netflix.spinnaker.orca.pipeline.model.Stage
 import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionNotFoundException
 import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository
+import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.ExecutionComparator
+import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.ExecutionComparator.*
 import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.ExecutionCriteria
 import com.netflix.spinnaker.orca.pipeline.persistence.UnpausablePipelineException
 import com.netflix.spinnaker.orca.pipeline.persistence.UnresumablePipelineException
 import de.huxhorn.sulky.ulid.SpinULID
-import org.jooq.DSLContext
-import org.jooq.Field
-import org.jooq.Record
-import org.jooq.SelectConditionStep
-import org.jooq.SelectConnectByStep
-import org.jooq.SelectForUpdateStep
-import org.jooq.SelectJoinStep
-import org.jooq.SelectWhereStep
-import org.jooq.Table
+import org.jooq.*
 import org.jooq.exception.SQLDialectNotSupportedException
 import org.jooq.impl.DSL
-import org.jooq.impl.DSL.count
-import org.jooq.impl.DSL.field
-import org.jooq.impl.DSL.name
-import org.jooq.impl.DSL.table
+import org.jooq.impl.DSL.*
 import org.slf4j.LoggerFactory
 import rx.Observable
 import java.lang.System.currentTimeMillis
@@ -66,7 +53,8 @@ class SqlExecutionRepository(
   private val partitionName: String?,
   private val jooq: DSLContext,
   private val mapper: ObjectMapper,
-  private val transactionRetryProperties: TransactionRetryProperties
+  private val transactionRetryProperties: TransactionRetryProperties,
+  private val batchReadSize: Int = 10
 ) : ExecutionRepository, ExecutionStatisticsRepository {
   companion object {
     val ulid = SpinULID(SecureRandom())
@@ -225,8 +213,8 @@ class SqlExecutionRepository(
       seek = {
         it.orderBy(field("id").desc())
           .run {
-            if (criteria.limit > 0) {
-              limit(criteria.limit)
+            if (criteria.pageSize > 0) {
+              limit(criteria.pageSize)
             } else {
               this
             }
@@ -254,7 +242,7 @@ class SqlExecutionRepository(
           .statusIn(criteria.statuses)
       },
       seek = {
-        it.orderBy(field("id").desc()).limit(criteria.limit)
+        it.orderBy(field("id").desc()).limit(criteria.pageSize)
       }
     )
 
@@ -265,24 +253,49 @@ class SqlExecutionRepository(
     application: String,
     criteria: ExecutionCriteria
   ): Observable<Execution> {
-    val select = jooq.selectExecutions(
-      ORCHESTRATION,
-      conditions = {
-        it.where(field("application").eq(application))
-          .statusIn(criteria.statuses)
-      },
-      seek = {
-        it.orderBy(field("id").desc())
-          .offset((criteria.page - 1) * criteria.limit)
-          .limit(criteria.limit)
-      }
-    )
-
-    return Observable.from(select.fetchExecutions())
+    return Observable.from(retrieveOrchestrationsForApplication(application, criteria, NATURAL_ASC))
   }
 
-  // TODO rz - Refactor to not use exceptions
-  // TODO rz - Refactor to allow different ExecutionTypes
+  override fun retrieveOrchestrationsForApplication(
+    application: String,
+    criteria: ExecutionCriteria,
+    sorter: ExecutionComparator?
+  ): MutableList<Execution> {
+    return jooq.selectExecutions(
+      ORCHESTRATION,
+      conditions = {
+        val where = it.where(field("application").eq(application))
+
+        val startTime = criteria.startTimeCutoff
+        if (startTime != null) {
+          where
+            .and(
+              field("start_time").greaterThan(startTime.toEpochMilli())
+                .or(field("start_time").isNull)
+            )
+            .statusIn(criteria.statuses)
+        } else {
+          where.statusIn(criteria.statuses)
+        }
+      },
+      seek = {
+        val ordered = when (sorter) {
+          START_TIME_OR_ID -> it.orderBy(field("start_time").desc().nullsFirst(), field("id").desc())
+          BUILD_TIME_DESC -> it.orderBy(field("build_time").asc(), field("id").asc())
+          else -> it.orderBy(field("id").desc())
+        }
+
+        ordered.offset((criteria.page - 1) * criteria.pageSize).limit(criteria.pageSize)
+      }
+    ).fetchExecutions().toMutableList()
+  }
+
+  override fun retrieveByCorrelationId(executionType: ExecutionType, correlationId: String) =
+    when (executionType) {
+      PIPELINE -> retrievePipelineForCorrelationId(correlationId)
+      ORCHESTRATION -> retrieveOrchestrationForCorrelationId(correlationId)
+    }
+
   override fun retrieveOrchestrationForCorrelationId(correlationId: String): Execution {
     val execution = jooq.selectExecution(ORCHESTRATION)
       .where(field("id").eq(
@@ -305,6 +318,31 @@ class SqlExecutionRepository(
     }
 
     throw ExecutionNotFoundException("No Orchestration found for correlation ID $correlationId")
+  }
+
+  override fun retrievePipelineForCorrelationId(correlationId: String): Execution {
+    val execution = jooq.selectExecution(PIPELINE)
+      .where(field("id").eq(
+        field(
+          jooq.select(field("c.pipeline_id"))
+            .from(table("correlation_ids").`as`("c"))
+            .where(field("c.id").eq(correlationId))
+            .limit(1)
+        ) as Any
+      ))
+      .fetchExecution()
+
+    if (execution != null) {
+      if (!execution.status.isComplete) {
+        return execution
+      }
+      jooq.transactional {
+        it.deleteFrom(table("correlation_ids")).where(field("id").eq(correlationId)).execute()
+      }
+    }
+
+    throw ExecutionNotFoundException("No Pipeline found for correlation ID $correlationId")
+
   }
 
   override fun retrieveBufferedExecutions(): MutableList<Execution> =
@@ -379,22 +417,70 @@ class SqlExecutionRepository(
     )
   }
 
-  override fun retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(pipelineConfigIds: MutableList<String>,
-                                                                             buildTimeStartBoundary: Long,
-                                                                             buildTimeEndBoundary: Long): Observable<Execution> {
+  override fun retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+    pipelineConfigIds: List<String>,
+    buildTimeStartBoundary: Long,
+    buildTimeEndBoundary: Long,
+    executionCriteria: ExecutionCriteria
+  ): List<Execution> {
     val select = jooq.selectExecutions(
-      ORCHESTRATION,
+      PIPELINE,
       conditions = {
-        it.where(field("config_id").`in`(pipelineConfigIds.toTypedArray()))
+        var conditions = it.where(
+          field("config_id").`in`(*pipelineConfigIds.toTypedArray())
           .and(field("build_time").gt(buildTimeStartBoundary))
           .and(field("build_time").lt(buildTimeEndBoundary))
+        )
+
+        if (executionCriteria.statuses.isNotEmpty()) {
+          val statusStrings = executionCriteria.statuses.map { it.toString() }
+          conditions = conditions.and(field("status").`in`(*statusStrings.toTypedArray()))
+        }
+
+        conditions
       },
       seek = {
-        it.orderBy(field("id").desc())
+        val seek = when (executionCriteria.sortType) {
+          ExecutionComparator.BUILD_TIME_ASC -> it.orderBy(field("build_time").asc())
+          ExecutionComparator.BUILD_TIME_DESC -> it.orderBy(field("build_time").desc())
+          ExecutionComparator.START_TIME_OR_ID -> it.orderBy(field("start_time").desc())
+          ExecutionComparator.NATURAL_ASC -> it.orderBy(field("id").desc())
+          else -> it.orderBy(field("id").asc())
+        }
+        seek
+          .limit(executionCriteria.pageSize)
+          .offset((executionCriteria.page - 1) * executionCriteria.pageSize)
       }
     )
 
-    return Observable.from(select.fetchExecutions())
+    return select.fetchExecutions().toList()
+  }
+
+  override fun retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+    pipelineConfigIds: List<String>,
+    buildTimeStartBoundary: Long,
+    buildTimeEndBoundary: Long,
+    executionCriteria: ExecutionCriteria
+  ): List<Execution> {
+    val allExecutions = mutableListOf<Execution>()
+    var page = 1
+    val pageSize = executionCriteria.pageSize
+    var moreResults = true
+
+    while (moreResults) {
+      val results = retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+        pipelineConfigIds,
+        buildTimeStartBoundary,
+        buildTimeEndBoundary,
+        executionCriteria.setPage(page)
+      )
+      moreResults = results.size >= pageSize
+      page += 1
+
+      allExecutions.addAll(results)
+    }
+
+    return allExecutions
   }
 
   override fun hasExecution(type: ExecutionType, id: String): Boolean {
@@ -452,6 +538,7 @@ class SqlExecutionRepository(
         field("status") to status,
         field("application") to execution.application,
         field("build_time") to (execution.buildTime ?: currentTimeMillis()),
+        field("start_time") to execution.startTime,
         field("canceled") to execution.isCanceled,
         field("updated_at") to currentTimeMillis(),
         field("body") to body
@@ -460,12 +547,14 @@ class SqlExecutionRepository(
       val updatePairs = mapOf(
         field("status") to status,
         field("body") to body,
+        // won't have started on insert
+        field("start_time") to execution.startTime,
         field("canceled") to execution.isCanceled,
         field("updated_at") to currentTimeMillis()
       )
 
       when (execution.type) {
-        PIPELINE      -> upsert(
+        PIPELINE -> upsert(
           ctx,
           execution.type.tableName,
           insertPairs.plus(field("config_id") to execution.pipelineConfigId),
@@ -535,7 +624,7 @@ class SqlExecutionRepository(
   private fun storeCorrelationIdInternal(ctx: DSLContext, execution: Execution) {
     if (execution.trigger.correlationId != null && !execution.status.isComplete) {
       val executionIdField = when (execution.type) {
-        PIPELINE      -> field("pipeline_id")
+        PIPELINE -> field("pipeline_id")
         ORCHESTRATION -> field("orchestration_id")
       }
 
@@ -590,7 +679,9 @@ class SqlExecutionRepository(
     if (statuses.isEmpty() || statuses.size == ExecutionStatus.values().size) {
       return this
     }
-    val clause = "status IN (${statuses.joinToString(",") { "'$it'" }})"
+
+    var statusStrings = statuses.map { it.toString() }
+    val clause = DSL.field("status").`in`(*statusStrings.toTypedArray())
 
     return run {
       when (this) {
@@ -655,10 +746,10 @@ class SqlExecutionRepository(
                                           fields: List<Field<Any>> = selectFields(),
                                           conditions: (SelectJoinStep<Record>) -> SelectConnectByStep<out Record>,
                                           seek: (SelectConnectByStep<out Record>) -> SelectForUpdateStep<out Record>) =
-      select(fields)
-        .from(type.tableName)
-        .let { conditions(it) }
-        .let { seek(it) }
+    select(fields)
+      .from(type.tableName)
+      .let { conditions(it) }
+      .let { seek(it) }
 
   private fun DSLContext.selectExecution(type: ExecutionType, fields: List<Field<Any>> = selectFields()) =
     select(fields)
@@ -673,11 +764,10 @@ class SqlExecutionRepository(
   private fun SelectForUpdateStep<out Record>.fetchExecution() =
     fetchExecutions().firstOrNull()
 
-  // TODO rz - Need to make pageSize configurable; doubtful that 10 is the right size.
   private fun fetchExecutions(nextPage: (Int, String?) -> Iterable<Execution>) =
     object : Iterable<Execution> {
       override fun iterator(): Iterator<Execution> =
-        PagedIterator(10, Execution::getId, nextPage)
+        PagedIterator(batchReadSize, Execution::getId, nextPage)
     }
 
   class SyntheticStageRequired : IllegalArgumentException("Only synthetic stages can be inserted ad-hoc")

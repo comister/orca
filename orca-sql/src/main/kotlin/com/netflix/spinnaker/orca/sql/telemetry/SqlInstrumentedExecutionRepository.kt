@@ -22,6 +22,7 @@ import com.netflix.spinnaker.orca.ExecutionStatus
 import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Stage
 import com.netflix.spinnaker.orca.pipeline.persistence.DelegatingExecutionRepository
+import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.ExecutionComparator
 import com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.ExecutionCriteria
 import com.netflix.spinnaker.orca.sql.pipeline.persistence.ActiveExecutionsReport
 import com.netflix.spinnaker.orca.sql.pipeline.persistence.ExecutionStatisticsRepository
@@ -171,6 +172,14 @@ class SqlInstrumentedExecutionRepository(
     }
   }
 
+  override fun retrieveOrchestrationsForApplication(application: String,
+                                                    criteria: ExecutionCriteria,
+                                                    sorter: ExecutionComparator?): MutableList<Execution> {
+    return withMetrics("retrieveOrchestrationsForApplication3") {
+      executionRepository.retrieveOrchestrationsForApplication(application, criteria, sorter)
+    }
+  }
+
   override fun retrievePipelinesForApplication(application: String): Observable<Execution> {
     return withMetrics("retrievePipelinesForApplication") {
       executionRepository.retrievePipelinesForApplication(application)
@@ -184,9 +193,21 @@ class SqlInstrumentedExecutionRepository(
     }
   }
 
+  override fun retrieveByCorrelationId(executionType: Execution.ExecutionType, correlationId: String): Execution {
+    return withMetrics("retrieveByCorrelationId") {
+      executionRepository.retrieveByCorrelationId(executionType, correlationId)
+    }
+  }
+
   override fun retrieveOrchestrationForCorrelationId(correlationId: String): Execution {
     return withMetrics("retrieveOrchestrationForCorrelationId") {
       executionRepository.retrieveOrchestrationForCorrelationId(correlationId)
+    }
+  }
+
+  override fun retrievePipelineForCorrelationId(correlationId: String): Execution {
+    return withMetrics("retrievePipelineForCorrelationId") {
+      executionRepository.retrievePipelineForCorrelationId(correlationId)
     }
   }
 
@@ -208,15 +229,33 @@ class SqlInstrumentedExecutionRepository(
     }
   }
 
-  override fun retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(pipelineConfigIds: MutableList<String>,
-                                                                             buildTimeStartBoundary: Long,
-                                                                             buildTimeEndBoundary: Long): Observable<Execution> {
+  override fun retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+    pipelineConfigIds: MutableList<String>,
+    buildTimeStartBoundary: Long,
+    buildTimeEndBoundary: Long,
+    executionCriteria: ExecutionCriteria
+  ): List<Execution> {
     return withMetrics("retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary") {
       executionRepository.retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
         pipelineConfigIds,
         buildTimeStartBoundary,
-        buildTimeEndBoundary
-      )
+        buildTimeEndBoundary,
+        executionCriteria)
+    }
+  }
+
+  override fun retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+    pipelineConfigIds: List<String>,
+    buildTimeStartBoundary: Long,
+    buildTimeEndBoundary: Long,
+    executionCriteria: ExecutionCriteria
+  ): List<Execution> {
+    return withMetrics("retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary") {
+      executionRepository.retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+        pipelineConfigIds,
+        buildTimeStartBoundary,
+        buildTimeEndBoundary,
+        executionCriteria)
     }
   }
 

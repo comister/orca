@@ -20,8 +20,8 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.netflix.spinnaker.orca.ExecutionStatus
 import com.netflix.spinnaker.orca.clouddriver.OortService
 import com.netflix.spinnaker.orca.clouddriver.pipeline.servergroup.support.Location
-import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Stage
+import com.netflix.spinnaker.orca.pipeline.util.RegionCollector
 import retrofit.RetrofitError
 import retrofit.client.Response
 import retrofit.mime.TypedString
@@ -33,12 +33,16 @@ import static com.netflix.spinnaker.orca.test.model.ExecutionBuilder.pipeline
 class FindImageFromClusterTaskSpec extends Specification {
 
   @Subject
-    task = new FindImageFromClusterTask()
+  task = new FindImageFromClusterTask()
   OortService oortService = Mock(OortService)
+  RegionCollector regionCollector = Mock(RegionCollector)
 
   def setup() {
+    regionCollector.getRegionsFromChildStages(_ as Stage) >> { stage -> new HashSet<String>() }
+
     task.oortService = oortService
     task.objectMapper = new ObjectMapper()
+    task.regionCollector = regionCollector
   }
 
   @Unroll
@@ -98,7 +102,11 @@ class FindImageFromClusterTaskSpec extends Specification {
 
   def "should be RUNNING if summary does not include imageId"() {
     given:
-    def stage = new Stage(Execution.newPipeline("orca"), "findImage", [
+    def pipe = pipeline {
+      application = "orca" // Should be ignored.
+    }
+
+    def stage = new Stage(pipe, "findImage", [
       cloudProvider    : "cloudProvider",
       cluster          : "foo-test",
       account          : "test",
@@ -174,6 +182,7 @@ class FindImageFromClusterTaskSpec extends Specification {
     ['foo-x86_64-201603232351']                                     | ['foo-x86_64-201603232351'] as Set
   }
 
+  @Unroll
   def "should resolve images via find if not all regions exist in source server group"() {
     given:
     def pipe = pipeline {
@@ -181,31 +190,43 @@ class FindImageFromClusterTaskSpec extends Specification {
     }
     def stage = new Stage(pipe, "findImage", [
       resolveMissingLocations: true,
-      cloudProvider          : "cloudProvider",
+      cloudProvider          : cloudProvider,
       cluster                : "foo-test",
       account                : "test",
       selectionStrategy      : "LARGEST",
       onlyEnabled            : "false",
-      regions                : [location1.value, location2.value]
+      regions                : [
+        location1.value
+        //Note: location2.value will come from regionCollectorResponse below
+      ]
     ])
 
     when:
     def result = task.execute(stage)
 
     then:
-    1 * oortService.getServerGroupSummary("foo", "test", "foo-test", "cloudProvider", location1.value,
+    1 * oortService.getServerGroupSummary("foo", "test", "foo-test", cloudProvider, location1.value,
       "LARGEST", FindImageFromClusterTask.SUMMARY_TYPE, false.toString()) >> oortResponse1
-    1 * oortService.getServerGroupSummary("foo", "test", "foo-test", "cloudProvider", location2.value,
+    findCalls * oortService.getServerGroupSummary("foo", "test", "foo-test", cloudProvider, location2.value,
       "LARGEST", FindImageFromClusterTask.SUMMARY_TYPE, false.toString()) >> {
       throw RetrofitError.httpError("http://clouddriver", new Response("http://clouddriver", 404, 'Not Found', [], new TypedString("{}")), null, Map)
     }
-    1 * oortService.findImage("cloudProvider", "ami-012-name-ebs*", "test", null, null) >> imageSearchResult
+    findCalls * oortService.findImage(cloudProvider, "ami-012-name-ebs*", "test", null, null) >> imageSearchResult
+    findCalls * regionCollector.getRegionsFromChildStages(stage) >> regionCollectorResponse
+
     assertNorth(result.outputs?.deploymentDetails?.find {
       it.region == "north"
     } as Map, [imageName: "ami-012-name-ebs"])
-    assertSouth(result.outputs?.deploymentDetails?.find {
-      it.region == "south"
-    } as Map, [sourceServerGroup: "foo-test", imageName: "ami-012-name-ebs1", foo: "bar"])
+
+    if (cloudProvider == "aws") {
+      assertSouth(result.outputs?.deploymentDetails?.find {
+        it.region == "south"
+      } as Map, [sourceServerGroup: "foo-test", imageName: "ami-012-name-ebs1", foo: "bar"])
+    } else {
+      assert !result.outputs?.deploymentDetails?.any {
+        it.region == "south"
+      }
+    }
 
     where:
     location1 = new Location(type: Location.Type.REGION, value: "north")
@@ -221,6 +242,8 @@ class FindImageFromClusterTaskSpec extends Specification {
                   ]]
     ]
 
+    regionCollectorResponse = [location2.value]
+
     imageSearchResult = [
       [
         imageName: "ami-012-name-ebs",
@@ -235,6 +258,10 @@ class FindImageFromClusterTaskSpec extends Specification {
         ]
       ]
     ]
+
+    cloudProvider || findCalls
+    "aws" || 1
+    "gcp" || 0
   }
 
   def "should resolve images via find if not all regions exist in source server group without build info"() {
@@ -366,7 +393,11 @@ class FindImageFromClusterTaskSpec extends Specification {
 
   def "should parse fail strategy error message"() {
     given:
-    def stage = new Stage(Execution.newPipeline("orca"), "whatever", [
+    def pipe = pipeline {
+      application = "orca" // Should be ignored.
+    }
+
+    def stage = new Stage(pipe, "whatever", [
       cloudProvider    : "cloudProvider",
       cluster          : "foo-test",
       account          : "test",
@@ -402,7 +433,10 @@ class FindImageFromClusterTaskSpec extends Specification {
   @Unroll
   'cluster with name "#cluster" and moniker "#moniker" should have application name "#expected"'() {
     given:
-    def stage = new Stage(Execution.newPipeline("orca"), 'findImageFromCluster', [
+    def pipe = pipeline {
+      application = "orca" // Should be ignored.
+    }
+    def stage = new Stage(pipe, 'findImageFromCluster', [
       cluster: cluster,
       moniker: moniker,
     ])

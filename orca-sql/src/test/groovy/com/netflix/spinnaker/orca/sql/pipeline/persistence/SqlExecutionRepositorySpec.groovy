@@ -28,11 +28,14 @@ import de.huxhorn.sulky.ulid.ULID
 import spock.lang.AutoCleanup
 import spock.lang.Shared
 import spock.lang.Unroll
+
+import static com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.ExecutionComparator.*
 import static com.netflix.spinnaker.orca.pipeline.persistence.ExecutionRepository.ExecutionCriteria
 
 import static com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType.PIPELINE
 import static com.netflix.spinnaker.orca.sql.SqlTestUtil.*
 import static com.netflix.spinnaker.orca.test.model.ExecutionBuilder.orchestration
+import static com.netflix.spinnaker.orca.test.model.ExecutionBuilder.pipeline
 
 class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepository> {
 
@@ -64,12 +67,12 @@ class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepo
 
   @Override
   SqlExecutionRepository createExecutionRepository() {
-    new SqlExecutionRepository("test", currentDatabase.context, mapper, new TransactionRetryProperties())
+    new SqlExecutionRepository("test", currentDatabase.context, mapper, new TransactionRetryProperties(), 10)
   }
 
   @Override
   SqlExecutionRepository createExecutionRepositoryPrevious() {
-    new SqlExecutionRepository("test", previousDatabase.context, mapper, new TransactionRetryProperties())
+    new SqlExecutionRepository("test", previousDatabase.context, mapper, new TransactionRetryProperties(), 10)
   }
 
   def "can store a new pipeline"() {
@@ -279,7 +282,7 @@ class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepo
 
   def "no specified page retrieves first page"() {
     given:
-    def criteria = new ExecutionCriteria().setLimit(limit)
+    def criteria = new ExecutionCriteria().setPageSize(limit)
 
     and:
     (limit + 1).times { i ->
@@ -287,6 +290,8 @@ class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepo
         application = "spinnaker"
         name = "Orchestration #${i + 1}"
       })
+      // our ULID implementation isn't monotonic
+      sleep(5)
     }
 
     when:
@@ -299,7 +304,7 @@ class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepo
 
     then:
     with(results) {
-      size() == criteria.limit
+      size() == criteria.pageSize
       first().name == "Orchestration #${limit + 1}"
       last().name == "Orchestration #2"
     }
@@ -310,7 +315,7 @@ class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepo
 
   def "out of range page retrieves empty result set"() {
     given:
-    def criteria = new ExecutionCriteria().setLimit(limit).setPage(3)
+    def criteria = new ExecutionCriteria().setPageSize(limit).setPage(3)
 
     and:
     (limit + 1).times { i ->
@@ -337,7 +342,7 @@ class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepo
 
   def "page param > 1 retrieves the relevant page"() {
     given:
-    def criteria = new ExecutionCriteria().setLimit(limit).setPage(2)
+    def criteria = new ExecutionCriteria().setPageSize(limit).setPage(2)
 
     and:
     (limit + 1).times { i ->
@@ -345,6 +350,8 @@ class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepo
         application = "spinnaker"
         name = "Orchestration #${i + 1}"
       })
+      // our ULID implementation isn't monotonic
+      sleep(5)
     }
 
     when:
@@ -368,7 +375,7 @@ class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepo
   @Unroll
   def "page size param restricts the number of results"() {
     given:
-    def criteria = new ExecutionCriteria().setLimit(limit).setPage(page)
+    def criteria = new ExecutionCriteria().setPageSize(limit).setPage(page)
 
     and:
     executions.times { i ->
@@ -377,7 +384,7 @@ class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepo
         name = "Orchestration #${i + 1}"
       })
       // our ULID implementation isn't monotonic
-      sleep(1)
+      sleep(5)
     }
 
     when:
@@ -400,5 +407,98 @@ class SqlExecutionRepositorySpec extends ExecutionRepositoryTck<SqlExecutionRepo
     21         | 2    | 5     || 5               | "Orchestration #16" | "Orchestration #12"
     21         | 5    | 5     || 1               | "Orchestration #1"  | "Orchestration #1"
     21         | 5    | 2     || 2               | "Orchestration #13" | "Orchestration #12"
+  }
+
+  def "can retrieve pipelines by configIds between build time boundaries"() {
+    given:
+    (storeLimit + 1).times { i ->
+      repository.store(pipeline {
+        application = "spinnaker"
+        pipelineConfigId = "foo1"
+        name = "Execution #${i + 1}"
+        buildTime = i + 1
+      })
+
+      repository.store(pipeline {
+        application = "spinnaker"
+        pipelineConfigId = "foo2"
+        name = "Execution #${i + 1}"
+        buildTime = i + 1
+      })
+    }
+
+    when:
+    def results = repository
+      .retrievePipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+      ["foo1", "foo2"],
+      0L,
+      6L,
+      new ExecutionCriteria()
+    )
+
+    then:
+    with(results) {
+      size() == retrieveLimit
+    }
+
+    where:
+    storeLimit = 6
+    retrieveLimit = 10
+  }
+
+  def "can retrieve ALL pipelines by configIds between build time boundaries"() {
+    given:
+    (storeLimit + 1).times { i ->
+      repository.store(pipeline {
+        application = "spinnaker"
+        pipelineConfigId = "foo1"
+        name = "Execution #${i + 1}"
+        buildTime = i + 1
+      })
+
+      repository.store(pipeline {
+        application = "spinnaker"
+        pipelineConfigId = "foo2"
+        name = "Execution #${i + 1}"
+        buildTime = i + 1
+      })
+    }
+
+    when:
+    List<Execution> forwardResults = repository
+      .retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+      ["foo1", "foo2"],
+      0L,
+      5L,
+      new ExecutionCriteria().setPageSize(1).setSortType(BUILD_TIME_ASC)
+    )
+    List<Execution> backwardsResults = repository
+      .retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+      ["foo1", "foo2"],
+      0L,
+      5L,
+      new ExecutionCriteria().setPageSize(1).setSortType(BUILD_TIME_DESC)
+    )
+
+    then:
+    forwardResults.size() == 8
+    forwardResults.first().buildTime == 1
+    backwardsResults.size() == 8
+    backwardsResults.first().buildTime == 4
+
+
+    where:
+    storeLimit = 6
+  }
+
+  def "doesn't fail on empty configIds"() {
+    expect:
+    repository
+      .retrieveAllPipelinesForPipelineConfigIdsBetweenBuildTimeBoundary(
+      [],
+      0L,
+      5L,
+      new ExecutionCriteria().setPageSize(1).setSortType(BUILD_TIME_ASC)
+    ).size() == 0
   }
 }

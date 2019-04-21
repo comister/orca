@@ -24,6 +24,7 @@ import com.netflix.spinnaker.orca.exceptions.ExceptionHandler
 import com.netflix.spinnaker.orca.exceptions.TimeoutException
 import com.netflix.spinnaker.orca.ext.beforeStages
 import com.netflix.spinnaker.orca.ext.failureStatus
+import com.netflix.spinnaker.orca.ext.isManuallySkipped
 import com.netflix.spinnaker.orca.pipeline.RestrictExecutionDuringTimeWindow
 import com.netflix.spinnaker.orca.pipeline.model.Execution
 import com.netflix.spinnaker.orca.pipeline.model.Execution.ExecutionType
@@ -40,7 +41,7 @@ import com.netflix.spinnaker.orca.time.toDuration
 import com.netflix.spinnaker.orca.time.toInstant
 import com.netflix.spinnaker.q.Message
 import com.netflix.spinnaker.q.Queue
-import org.apache.commons.lang.time.DurationFormatUtils
+import org.apache.commons.lang3.time.DurationFormatUtils
 import org.slf4j.MDC
 import org.springframework.stereotype.Component
 import java.time.Clock
@@ -81,6 +82,8 @@ class RunTaskHandler(
           queue.push(CompleteTask(message, CANCELED))
         } else if (execution.status == PAUSED) {
           queue.push(PauseTask(message))
+        } else if (stage.isManuallySkipped()) {
+          queue.push(CompleteTask(message, SKIPPED))
         } else {
           try {
             task.checkForTimeout(stage, taskModel, message)
@@ -104,7 +107,7 @@ class RunTaskHandler(
                     queue.push(message, task.backoffPeriod(taskModel, stage))
                     trackResult(stage, thisInvocationStartTimeMs, taskModel, result.status)
                   }
-                  SUCCEEDED, REDIRECT, FAILED_CONTINUE, STOPPED -> {
+                  SUCCEEDED, REDIRECT, SKIPPED, FAILED_CONTINUE, STOPPED -> {
                     queue.push(CompleteTask(message, result.status))
                     trackResult(stage, thisInvocationStartTimeMs, taskModel, result.status)
                   }
@@ -219,7 +222,7 @@ class RunTaskHandler(
           val durationString = formatTimeout(elapsedTime.toMillis())
           val msg = StringBuilder("${javaClass.simpleName} of stage ${stage.name} timed out after $durationString. ")
           msg.append("pausedDuration: ${formatTimeout(pausedDuration.toMillis())}, ")
-          msg.append("elapsedTime: ${formatTimeout(elapsedTime.toMillis())},")
+          msg.append("elapsedTime: ${formatTimeout(elapsedTime.toMillis())}, ")
           msg.append("timeoutValue: ${formatTimeout(actualTimeout.toMillis())}")
 
           log.warn(msg.toString())
@@ -302,13 +305,20 @@ class RunTaskHandler(
 
   private fun Stage.withLoggingContext(taskModel: com.netflix.spinnaker.orca.pipeline.model.Task, block: () -> Unit) {
     try {
+      MDC.put("application", this.execution.application)
       MDC.put("stageType", type)
       MDC.put("taskType", taskModel.implementingClass)
+
+      if (taskModel.startTime != null) {
+        MDC.put("taskStartTime", taskModel.startTime.toString())
+      }
 
       block.invoke()
     } finally {
       MDC.remove("stageType")
       MDC.remove("taskType")
+      MDC.remove("taskStartTime")
+      MDC.remove("application")
     }
   }
 }
